@@ -1643,6 +1643,11 @@ either version of this curve as load-bearing for a README claim.
 
 ### 2026-09-18 (continued) -- M9 task 2: the ablation matrix finds the throughput win M8 couldn't see
 
+> **Corrected 2026-10-07** -- the "throughput win" and "monotonically"
+> claims below don't survive a re-read of the same CSV. See the
+> 2026-10-07 entry at the end of this file. Left in place, as with the M7
+> correction above, because the correction is part of the record.
+
 M8's single-point ablation table (k/I=0.5, cache=10% of I) found real byte
 savings from caching (25.0% -> 29.6%) but NO clear throughput win --
 cache-aware DIP's tok/s (7.0-7.3) was statistically indistinguishable from
@@ -1746,3 +1751,40 @@ ascending-order guarantee (e.g. a parallel prefix-sum/stream-compaction
 across blocks, rather than either the old unordered atomic race or
 today's single-thread scan) would very plausibly recover most of this
 regression without reintroducing the non-determinism.
+
+### 2026-10-07 -- re-reading the M9 matrix: there is no throughput win, and the writeup said otherwise
+
+Re-read `reports/m9_ablation_matrix.csv` against the README before sharing
+the repo. The 2026-09-18 M9 task 2 entry (and the README/OVERVIEW/RESULTS
+text built on it) framed the sweep as "finding the throughput win M8
+couldn't see." The same CSV doesn't support that:
+
+- **Nothing beats dense.** Dense offload is 12.10 tok/s. The best DIP point
+  in the whole matrix is 10.63 tok/s (k/I=0.125, 22,126x perplexity).
+- **Cache-aware DIP doesn't beat plain DIP where it matters.** At k/I=0.5,
+  plain DIP is 7.70 tok/s and the best cache (20%) is 7.29. The same holds
+  at k/I=0.75 and 1.0. The cache only wins at k/I <= 0.375, where
+  perplexity is already 42x dense or worse. What the old entry called a
+  win was throughput rising with cache size *relative to a 5% cache*, and
+  turning the cache on at 5% is itself a loss of 0.7-1.1 tok/s.
+- **"Monotonically" was wrong.** k/I=0.25 goes 9.17 -> 8.15 -> 9.77 tok/s.
+  With one seed and M8's own 7.03-7.31 tok/s run-to-run spread, sub-0.5
+  tok/s differences between nearby points aren't established.
+
+The diagnosis that the data does support, now written into the README:
+
+1. **Mechanism overhead.** Plain DIP at k/I=1.0 moves the same bytes as
+   dense and runs at 5.58 tok/s: ~97 ms of selection/gather/accumulate
+   overhead on an ~83 ms dense token. Nsight already said this (three DIP
+   kernels = ~96% of captured kernel time); the writeup didn't connect it
+   to the headline.
+2. **Accuracy-per-byte.** Even at zero overhead, 33.6% fewer bytes caps the
+   gain at ~1.5x if per-token time were purely transfer, and buys a 14x
+   perplexity cost under raw-gate-magnitude selection.
+
+Lesson, same shape as the M7 re-run: a narrative ("the bigger sweep finds
+the win") got written and then the numbers got read through it. The check
+that would have caught it is the dumb one -- put the dense row next to
+every claimed improvement and ask whether anything crosses it.
+`bench/plot_results.py` now draws plain DIP as each line's cache=0 point,
+next to the dense line, so the plot can't hide this either.

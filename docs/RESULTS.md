@@ -279,9 +279,11 @@ perplexity: 16.50, teacher-forced over a 70-token passage):
 | 0.125 | 43.8% | 9.54 | 365,166.03 | 22,126.39x |
 
 Perplexity degrades roughly log-linearly from k/I=0.75 down to 0.25, then
-falls off a real cliff at k/I=0.125. **k/I=0.5 is the defensible operating
-point**: a 14x perplexity ratio is bad but the output is presumably still
-related to the source text, for 25% fewer bytes/token. Below k/I=0.25 the
+falls off a real cliff at k/I=0.125. **No point on this curve is a usable
+operating point**: even k/I=0.75 costs 3.5x perplexity for 12.5% of bytes
+saved, and k/I=0.5 (14x for 25%) is only the least-bad point that saves a
+meaningful share of bytes. Every point is also slower than dense offload
+(12.10 tok/s) -- see M8/M9 below for why. Below k/I=0.25 the
 model is producing something closer to noise than degraded text. Honest
 caveat, unchanged since first measured: ONE model (1.7B), ONE 70-token
 passage, top-k-by-raw-gate-magnitude as the only selection criterion tried
@@ -337,9 +339,10 @@ reproduced bit-identical across independent runs:
 
 **Cache-aware DIP's perplexity is bit-identical to plain DIP's** (not just
 close) -- direct hardware confirmation that caching changes only where
-bytes come from, never the arithmetic. At this single (k/I, cache_frac)
-point, the throughput win isn't yet visible above run-to-run noise; M9's
-fuller sweep (below) shows it's there, just needed a bigger cache to see.
+bytes come from, never the arithmetic. Throughput is a loss on both
+counts: +DIP is 37% slower than dense, and adding the cache makes it
+slower still (7.03-7.31 vs. 7.64 tok/s) despite moving fewer bytes. M9's
+fuller sweep (below) shows the same pattern at every k/I >= 0.5.
 
 Every real bug found verifying M8 (five of them, only one directly in the
 "centerpiece" fused-GEMV numerics this milestone was most worried about) is
@@ -367,13 +370,29 @@ shortfall is launch configuration (batch=1 decode inherently underfills a
 **Ablation matrix** (lean scope: Qwen3-1.7B only, INT4 group-128, one seed
 -- see `bench/bench_m9_ablation_matrix.py`'s docstring for the reasoning;
 18 new (k/I, cache_frac) points on top of M7's 7 already-verified rows).
-**At a fixed k/I, tokens/sec increases monotonically with cache_frac**:
-at k/I=0.5, 6.75 -> 6.90 -> 7.29 tok/s as cache grows 5% -> 10% -> 20% of
-I. M8's single measured point just sat too early on this curve to see the
-throughput win the byte savings implied was there. Every cache-aware-DIP
-row's perplexity is bit-identical to the matching plain-DIP row at the
-same k/I, across all 18 points -- extending M8's single-point
-cache-correctness confirmation to the full matrix.
+**No configuration reaches dense throughput** (12.10 tok/s; best DIP
+point is 10.63 tok/s at k/I=0.125, where perplexity is 22,126x dense).
+What the sweep shows:
+
+- **The DIP mechanism itself is the dominant cost.** Plain DIP at k/I=1.0
+  moves exactly as many bytes as dense but runs at 5.58 tok/s, so the
+  selection/gather/accumulate path adds ~97 ms to an ~83 ms token before
+  any pruning happens. This matches the Nsight finding above: three DIP
+  kernels are ~96% of captured kernel time.
+- **Turning the cache on has a fixed cost.** Going from plain DIP to a 5%
+  cache lowers throughput at every k/I except 0.25 (e.g. 7.70 -> 6.75 at
+  k/I=0.5). Larger caches recover some of it: at k/I=0.5, 6.75 -> 6.90 ->
+  7.29 tok/s for 5% -> 10% -> 20% of I. At k/I >= 0.5 no cache size tested
+  beats plain DIP; at k/I <= 0.375 the 10% and 20% caches do (e.g. 8.29 ->
+  8.86 at k/I=0.375), but those points already cost 42x perplexity or more.
+- **Throughput is single-seed and noisy.** The trend with cache size is not
+  monotonic at k/I=0.25 (9.17 -> 8.15 -> 9.77), and repeated M8 runs of one
+  configuration spread over 7.03-7.31 tok/s, so differences under ~0.5
+  tok/s between nearby points aren't established.
+
+Every cache-aware-DIP row's perplexity is bit-identical to the matching
+plain-DIP row at the same k/I, across all 18 points -- extending M8's
+single-point cache-correctness confirmation to the full matrix.
 
 **Robustness**: reviewed `csrc/bindings.cpp` (90+ existing `TORCH_CHECK`s)
 against PROJECT_SPEC.md's named concerns. Found and fixed the spec's own

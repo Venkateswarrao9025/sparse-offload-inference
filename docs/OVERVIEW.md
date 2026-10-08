@@ -26,17 +26,20 @@ before it:
    second CUDA stream while the GPU is still computing with weight `N`, so
    the transfer is (mostly) hidden behind useful work instead of adding to
    the critical path.
-3. **Don't transfer what you don't need**: in a transformer's SwiGLU MLP,
-   most of the "intermediate" channels contribute almost nothing to any
-   given token's output. Compute which channels matter *first* (a cheap
-   top-k over the gate activation), then stream only those channels'
-   weight rows — not the whole matrix. A GPU-resident cache holds the
-   channels that turn out to matter across *many* tokens, so the ones
+3. **Don't transfer what you don't need**: the hypothesis is that in a
+   transformer's SwiGLU MLP, many of the "intermediate" channels contribute
+   little to any given token's output. Compute which channels matter
+   *first* (a top-k over the gate activation), then stream only those
+   channels' weight rows — not the whole matrix. A GPU-resident cache holds
+   the channels that turn out to matter across *many* tokens, so the ones
    that matter most never need to be re-streamed at all.
 
-Layer 3 is the actual research contribution — everything else is standard
+Layer 3 is the actual research question — everything else is standard
 practice, executed carefully. It's called **Dynamic Input Pruning (DIP)**
-in this repo, and the cache-resident version is **cache-aware DIP**.
+in this repo, and the cache-resident version is **cache-aware DIP**. In
+this implementation the answer came out negative: layer 3 made decoding
+slower and much less accurate than layers 1-2 alone (see "The result"
+below).
 
 ## Why this is hard to get right (and why that's the point)
 
@@ -102,8 +105,8 @@ generation.
 **Dynamic Input Pruning wired into a real decode loop**: for each token,
 compute the gate projection densely (need every channel's magnitude to know
 which ones matter), select the top-k, then only stream (or cache-hit) those
-channels' up/down-projection rows — reducing bytes transferred per token
-without touching accuracy any more than necessary.
+channels' up/down-projection rows — reducing bytes transferred per token,
+at an accuracy cost measured by the Pareto curve below.
 
 **A calibration-driven hot cache**: run a representative passage through the
 model once, record which channels get selected most often (the skew turns
@@ -122,25 +125,40 @@ inputs and fails loudly instead of silently corrupting memory on a
 malformed shape), and CI that runs the CPU-only half of the test suite on
 every push.
 
-## The headline result
+## The result: pruning lost to dense offload
 
-> On a single NVIDIA T4, decoding Qwen3-1.7B quantized to group-128
-> symmetric INT4 with weights offloaded to host memory, cache-aware DIP at
-> k/I = 0.5 (cache = 20% of intermediate channels) reaches 7.29 tok/s vs
-> 7.70 tok/s for plain DIP and 12.08 tok/s for dense offload with the same
-> kernels — at a perplexity cost of 14.01x dense — while transferring 33.6%
-> fewer bytes/token than dense.
+The short version: **skipping channels did not make decoding faster.** On a
+single NVIDIA T4, decoding Qwen3-1.7B (group-128 symmetric INT4, weights
+offloaded to host memory), keeping half the MLP channels (k/I = 0.5):
 
-The more interesting fact underneath that headline: **cache-aware DIP's
-perplexity is bit-identical to plain DIP's**, confirmed across independent
-runs and again across an 18-point sweep of cache sizes and pruning
-fractions. That's a hardware-confirmed correctness property, not just a
-design intention — caching changes *where* weight bytes come from and
-never changes the arithmetic. See [README.md](../README.md) for the full
-headline writeup, honest caveats included (this is measured on the 1.7B
-model with one eval passage, not the larger 14B model the spec's own
-example claim format uses — a deliberate, documented scope decision, not an
-oversight).
+- dense offload with the same kernels: **12.10 tok/s**, perplexity 16.50
+- plain DIP: 7.70 tok/s, 25.0% fewer bytes/token, perplexity 231.26 (14x)
+- cache-aware DIP (cache = 20% of channels): 7.29 tok/s, 33.6% fewer
+  bytes/token, perplexity 231.26 (14x)
+
+(`reports/m9_ablation_matrix.csv`; an earlier independent run in
+`reports/m8_ablation.csv` agrees.)
+
+Two things went wrong, and they're separate:
+
+1. **The machinery costs more than it saves.** Choosing which channels to
+   keep, gathering them, and accumulating the result is slow enough that
+   DIP with *nothing* pruned runs at less than half of dense speed (5.58 vs.
+   12.10 tok/s). Profiling pins most of that on three kernels — the top-k
+   selection kernel, which uses only one of the GPU's 40 SMs, and the two
+   down-projection kernels — plus a CPU-GPU sync in every layer.
+2. **The accuracy cost is too high for what's saved.** Even if the
+   machinery were free, saving a third of the bytes could make a token at
+   most ~1.5x faster, and it costs 14x perplexity. Picking channels by raw
+   gate magnitude, the only rule tried, drops channels the model needs.
+
+What did hold up: **cache-aware DIP's perplexity is bit-identical to plain
+DIP's**, confirmed across independent runs and across an 18-point sweep of
+cache sizes and pruning fractions. The cache changes *where* weight bytes
+come from and never the arithmetic. See [README.md](../README.md) for the
+full numbers and caveats (one 1.7B model and one eval passage, not the
+larger 14B model the spec's example claim uses — a documented scope
+decision).
 
 ## How the pieces fit together
 
@@ -229,7 +247,7 @@ is a signal of judgment, not a weakness:
 
 ## Where to look next
 
-- **[README.md](../README.md)** — the headline result, the three key plots,
+- **[README.md](../README.md)** — the result and why, the three key plots,
   and how to reproduce them from a clean clone.
 - **[RESULTS.md](RESULTS.md)** — every number this project has ever
   reported, organized by milestone, each one sourced from a checked-in CSV.

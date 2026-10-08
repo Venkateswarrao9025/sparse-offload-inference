@@ -89,17 +89,20 @@ def plot_ablation_matrix() -> None:
     cached = [r for r in rows if r["mode"] == "cache_aware_dip"]
     dense = next(r for r in rows if r["mode"] == "dense")
     k_values = sorted({float(r["k_over_I"]) for r in cached})
+    # plain-DIP rows are the cache_frac=0 point of each line, so every line
+    # starts from "no cache" and shows whether caching helped at that k/I
+    lines = [r for r in rows if r["mode"] in ("dip", "cache_aware_dip")]
 
     fig, ax = plt.subplots(figsize=(8, 5))
     for k in k_values:
-        sub = sorted([r for r in cached if float(r["k_over_I"]) == k], key=lambda r: float(r["cache_frac"]))
+        sub = sorted([r for r in lines if float(r["k_over_I"]) == k], key=lambda r: float(r["cache_frac"]))
         cache_frac = [float(r["cache_frac"]) for r in sub]
         tok_s = [float(r["tokens_per_sec"]) for r in sub]
         ax.plot(cache_frac, tok_s, marker="o", label=f"k/I={k:g}")
     ax.axhline(float(dense["tokens_per_sec"]), color="gray", linestyle="--", linewidth=1, label="dense")
-    ax.set_xlabel("cache_frac (fraction of I resident in HotCache)")
+    ax.set_xlabel("cache_frac (fraction of I resident in HotCache; 0 = plain DIP)")
     ax.set_ylabel("tokens/sec")
-    ax.set_title("M9: cache-aware DIP throughput increases with cache size,\nat every k/I (Qwen3-1.7B)")
+    ax.set_title("M9: no DIP or cache-aware DIP point reaches dense throughput\n(Qwen3-1.7B, one seed)")
     ax.legend(fontsize=8)
     fig.tight_layout()
     out = REPORTS_DIR / "m9_ablation_matrix.png"

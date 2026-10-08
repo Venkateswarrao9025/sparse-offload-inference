@@ -14,26 +14,56 @@ checked-in CSV in `reports/` (PROJECT_SPEC.md sec 6/9's own rule) -- see
 actually happened, including five real, hardware-verification-only-visible
 bugs found and fixed along the way.
 
-## Headline result
+## Result: input-dependent pruning loses to dense offload
 
-On a single NVIDIA T4 (15 GB, PCIe pinned host memory at ~12.3 GB/s
-measured), decoding Qwen3-1.7B quantized to group-128 symmetric INT4 with
-weights offloaded to host memory, cache-aware DIP at k/I = 0.5 (cache = 20%
-of I) reaches **7.29 tok/s** vs **7.70 tok/s** for plain DIP and **12.08
-tok/s** for dense offload with the same kernels -- at a WikiText-style
-teacher-forced perplexity cost of **14.01x dense** (16.50 -> 231.26),
-transferring **33.6% fewer bytes/token** than dense. Median of independent
-runs, 70-token eval passage, batch 1. (See the honest caveats below --
-this is a real, reproduced number, not a cherry-picked best case.)
+**In this implementation, Dynamic Input Pruning (with or without the hot
+cache) is slower than plain dense offload and much less accurate.** No
+configuration measured beats dense on throughput.
 
-**The part that's actually novel here isn't the speedup -- it's that
-cache-aware DIP's perplexity is BIT-IDENTICAL to plain DIP's** (231.262 to
-the last decimal, confirmed across two independent full ablation runs and
-again across all 18 points of a fuller cache-size sweep): caching changes
-only where weight bytes come from, never the arithmetic. That's a real,
-hardware-confirmed correctness property, not just a design intention.
+On a single NVIDIA T4 (15 GB, pinned-host PCIe at ~12.3 GB/s measured),
+decoding Qwen3-1.7B (group-128 symmetric INT4, weights offloaded to host
+memory, batch 1, 70-token teacher-forced eval passage), at k/I = 0.5:
 
-## The three headline artifacts
+| mode | bytes/token saved | tok/s | perplexity |
+|---|---|---|---|
+| dense offload (same kernels) | 0% | **12.10** | 16.50 |
+| plain DIP | 25.0% | 7.70 | 231.26 (14.0x) |
+| cache-aware DIP, cache = 20% of I | 33.6% | 7.29 | 231.26 (14.0x) |
+
+Source: `reports/m9_ablation_matrix.csv` (one seed). `reports/m8_ablation.csv`
+is an earlier, independent run of the same three modes (cache = 10% of I)
+and agrees: 12.08 / 7.64 / 7.03 tok/s, identical perplexities.
+
+**Why it loses -- two separate problems:**
+
+1. **The pruning mechanism costs more than the bytes it saves.** DIP at
+   k/I = 1.0 keeps every channel and transfers exactly as many bytes as
+   dense, yet runs at 5.58 tok/s vs. 12.10 -- the selection machinery alone
+   adds ~97 ms to an ~83 ms token before any bytes are saved. Turning the
+   cache on adds a further fixed cost: at k/I >= 0.375, going from no cache
+   to a 5% cache *lowers* throughput by 0.7-1.1 tok/s, and at k/I >= 0.5
+   even a 20% cache never wins it back. Nsight Compute (at Qwen3-14B shapes)
+   puts ~96% of captured kernel time in three kernels:
+   `topk_threshold_select` (runs on 1 of the T4's 40 SMs, ~144x over its
+   target after a determinism fix) and the two down-projection accumulate
+   kernels (half the SMs, poorly coalesced loads). Each decode layer also
+   blocks on a device-to-host copy of the selected indices before it can
+   start the row gather; the cache path adds a second sync for the miss
+   count. See `reports/m9_ncu_summary.md`.
+2. **Even with zero overhead, the trade wouldn't be worth it.** If per-token
+   time scaled purely with bytes transferred (M6 shows every streamed matrix
+   is transfer-bound), saving 33.6% of bytes caps the gain at ~1.5x. That
+   ceiling costs a 14x perplexity increase, because top-k by raw gate
+   magnitude is the only channel-selection criterion tried, and it throws
+   away channels the model needs.
+
+**What does hold up:** cache-aware DIP's perplexity is **bit-identical** to
+plain DIP's (231.26173400878906 at k/I = 0.5, and matching at all 18
+cache-size/k points of the M9 sweep, plus two independent M8 runs). The
+cache changes only where weight bytes come from, never the arithmetic. It
+also saves real bytes: 25.0% -> 33.6% fewer per token at k/I = 0.5.
+
+## The three key plots
 
 **Roofline** (M6): every weight matrix streamed over PCIe is transfer-bound,
 not compute-bound -- the copy takes 5.5x-10.2x longer than the GEMV kernel
@@ -48,19 +78,22 @@ gap turned out not to matter for the system as a whole.
 real kernel non-determinism bug was found and fixed -- see
 [docs/LEARNING_NOTES.md](docs/LEARNING_NOTES.md)): perplexity degrades
 roughly log-linearly down to k/I=0.25, then falls off a real cliff at
-k/I=0.125. k/I=0.5 is the defensible operating point.
+k/I=0.125. Even the mildest pruning point tested (k/I=0.75, 12.5% of bytes
+saved) already costs 3.5x perplexity; k/I=0.5 (14x) is the least-bad point
+that saves a meaningful share of bytes, not a usable one.
 
 ![M7 Pareto curve](reports/m7_pareto.png)
 
-**Ablation table** (M8's headline artifact, extended by M9's fuller sweep):
-dense -> +DIP -> +cache-aware DIP, with bytes/token, tokens/sec, and
-perplexity for each row -- see [docs/RESULTS.md](docs/RESULTS.md#m8----cache-aware-dip)
-for the table. The fuller M9 sweep across cache sizes shows the throughput
-win M8's single measured point couldn't see on its own:
+**Ablation matrix** (M8's dense -> +DIP -> +cache-aware DIP table, extended
+by M9's sweep over k/I x cache size -- full tables in
+[docs/RESULTS.md](docs/RESULTS.md#m8----cache-aware-dip)). Each line starts
+at plain DIP (cache = 0); the dashed line is dense offload. No point
+reaches it. A cache beats plain DIP only at k/I <= 0.375, where perplexity
+is already 42x dense or worse:
 
-![M9: cache-aware DIP throughput vs. cache size](reports/m9_ablation_matrix.png)
+![M9: DIP and cache-aware DIP throughput vs. cache size, against dense](reports/m9_ablation_matrix.png)
 
-## Honest caveats (read before citing the headline number)
+## Caveats (read before citing any number above)
 
 - **One model** (Qwen3-1.7B), **one 70-token eval passage**,
   top-k-by-raw-gate-magnitude as the only channel-selection criterion tried.
@@ -73,17 +106,23 @@ win M8's single measured point couldn't see on its own:
   model). This is the clearest, best-quantified target for future kernel
   work -- see `reports/m9_ncu_summary.md` and
   [docs/LEARNING_NOTES.md](docs/LEARNING_NOTES.md).
-- **Cache-aware DIP's throughput win is real but modest at the scales
-  tested** (Qwen3-1.7B, cache up to 20% of I) -- M9's ablation matrix shows
-  it's monotonically increasing with cache size, but a bigger model or
-  cache fraction would show it more clearly. Byte savings are unambiguous
-  at every scale tested; throughput needed the fuller sweep to see clearly.
+- **Throughput numbers are single-seed and noisy.** Repeated M8 runs of the
+  same cache-aware configuration spread over 7.03-7.31 tok/s, and the M9
+  sweep is not monotonic in cache size at k/I = 0.25 (9.17 -> 8.15 -> 9.77
+  tok/s). Differences under ~0.5 tok/s between nearby points shouldn't be
+  read as real. The dense-vs-DIP gap (12.1 vs. <= 7.7 at k/I >= 0.5) is far
+  larger than that noise. Perplexity and bytes/token are deterministic and
+  reproduce exactly.
+- **Measured at 1.7B, not the 14B model the spec targets.** At 14B the
+  transfer share of each token is larger, which favors byte savings, but
+  `topk_threshold_select` and the down-projection kernels also get slower
+  with I. Which effect wins there is unmeasured.
 
 ## Reproducing this
 
 This project's own dev machine has no NVIDIA GPU -- everything CUDA-dependent
 runs on a Colab or Kaggle T4 session, never locally. A stranger with GPU
-access reproduces the headline number the same way this project's own
+access reproduces the results above the same way this project's own
 sessions do:
 
 ```
